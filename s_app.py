@@ -56,6 +56,21 @@ if "post_test_completed" not in st.session_state:
 if "user_id" not in st.session_state:
     st.session_state.user_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+# --- Reset Session Function ---
+def reset_session():
+    """Reset all session state for new user"""
+    st.session_state.messages = []
+    st.session_state.current_page = "welcome"
+    st.session_state.pre_test_completed = False
+    st.session_state.post_test_completed = False
+    st.session_state.user_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if "pre_test_scores" in st.session_state:
+        del st.session_state.pre_test_scores
+    if "post_test_scores" in st.session_state:
+        del st.session_state.post_test_scores
+    if "participant_info" in st.session_state:
+        del st.session_state.participant_info
+
 # --- PISA Questions ---
 PISA_QUESTIONS = {
     "Financial Knowledge": [
@@ -135,7 +150,15 @@ def load_resources():
         embedding_function=embeddings,
         persist_directory=PERSIST_DIR
     )
-    llm = Ollama(model=LLM_MODEL)
+    
+    # OPTIMIZED LLM with speed parameters
+    llm = Ollama(
+        model=LLM_MODEL,
+        temperature=0.7,
+        num_predict=256,  # Limit response length (faster)
+        top_k=10,         # Reduce sampling space (faster)
+        top_p=0.9         # Nucleus sampling (more focused)
+    )
     return db, llm
 
 db, llm = load_resources()
@@ -168,15 +191,42 @@ def save_test_results(test_type, participant_info, responses, scores):
 
 def save_feedback(question, answer, rating, sources):
     """Save user feedback"""
-    feedback_file = "user_feedback.json"
+    feedback_file = "data/user_feedback.json"
     
     feedback_entry = {
         "user_id": st.session_state.user_id,
         "timestamp": datetime.now().isoformat(),
+        "feedback_type": "response",
         "question": question,
         "answer": answer[:500],
         "rating": rating,
         "sources_count": len(sources)
+    }
+    
+    try:
+        with open(feedback_file, 'r', encoding='utf-8') as f:
+            feedback_data = json.load(f)
+    except FileNotFoundError:
+        feedback_data = {"feedback": []}
+    
+    feedback_data["feedback"].append(feedback_entry)
+    
+    with open(feedback_file, 'w', encoding='utf-8') as f:
+        json.dump(feedback_data, f, indent=2, ensure_ascii=False)
+
+def save_general_feedback(user_id, feedback_text, rating):
+    """Save general user feedback about the chatbot experience"""
+    feedback_file = "data/user_feedback.json"
+    
+    feedback_entry = {
+        "user_id": user_id,
+        "timestamp": datetime.now().isoformat(),
+        "feedback_type": "general",
+        "feedback_text": feedback_text,
+        "rating": rating,
+        "question": "General Feedback",
+        "answer": "N/A",
+        "sources_count": 0
     }
     
     try:
@@ -202,14 +252,12 @@ def calculate_scores(responses):
         for q in questions:
             response = next((r for r in responses if r["question_id"] == q["id"]), None)
             if response:
-                # Score is based on option index (0-indexed)
                 score_value = response["score"]
                 total_score += score_value
-                max_score += len(q["options"]) - 1  # Max is last option
+                max_score += len(q["options"]) - 1
         
         category_scores[category] = (total_score / max_score * 100) if max_score > 0 else 0
     
-    # Overall score
     all_scores = list(category_scores.values())
     category_scores["Overall"] = sum(all_scores) / len(all_scores) if all_scores else 0
     
@@ -236,29 +284,41 @@ def rewrite_query(query: str) -> str:
 def run_rag_chain(query: str, llm):
     expanded_query = rewrite_query(query)
     
+    # OPTIMIZED: Reduce number of documents retrieved
     retriever = db.as_retriever(
         search_type="mmr",
-        search_kwargs={"k": 5, "fetch_k": 20, "lambda_mult": 0.5}
+        search_kwargs={"k": 3, "fetch_k": 12, "lambda_mult": 0.5}
     )
     
     docs = retriever.invoke(expanded_query)
-    context = "\n\n".join([doc.page_content for doc in docs])
     
-    prompt = f"""You are a knowledgeable financial literacy assistant specializing in Malaysian finance and EPF (KWSP) matters.
+    # OPTIMIZED: Limit context length to speed up processing
+    context_parts = []
+    total_chars = 0
+    max_chars = 2000
+    
+    for doc in docs:
+        content = doc.page_content
+        if total_chars + len(content) <= max_chars:
+            context_parts.append(content)
+            total_chars += len(content)
+        else:
+            remaining = max_chars - total_chars
+            if remaining > 200:
+                context_parts.append(content[:remaining])
+            break
+    
+    context = "\n\n".join(context_parts)
+    
+    # OPTIMIZED: Shorter, more focused prompt
+    prompt = f"""You are a financial literacy assistant for Malaysian youth.
 
-INSTRUCTIONS:
-1. Answer using ONLY the information provided in the context
-2. Be specific and provide actionable advice when possible
-3. If context doesn't contain enough information, say so honestly
-4. Use examples from context to support your answer
-5. Keep your answer clear, concise, and easy to understand
-
-CONTEXT:
+Context:
 {context}
 
-QUESTION: {query}
+Question: {query}
 
-DETAILED ANSWER:"""
+Provide a clear, concise answer (2-3 paragraphs max) based only on the context above:"""
     
     response_stream = llm.stream(prompt)
     sources = [{"content": doc.page_content, "metadata": doc.metadata} for doc in docs]
@@ -310,7 +370,6 @@ def show_pisa_test(test_type="pre"):
     **Questions:** {sum(len(v) for v in PISA_QUESTIONS.values())} | **Time:** ~5 minutes
     """)
     
-    # Participant info (only for pre-test)
     if test_type == "pre":
         with st.expander("👤 Your Information", expanded=True):
             col1, col2 = st.columns(2)
@@ -335,7 +394,6 @@ def show_pisa_test(test_type="pre"):
     
     st.divider()
     
-    # Display questions
     all_responses = []
     question_number = 1
     
@@ -365,7 +423,6 @@ def show_pisa_test(test_type="pre"):
             question_number += 1
             st.divider()
     
-    # Submit button
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
         if st.button("📤 Submit Assessment", type="primary", use_container_width=True):
@@ -389,7 +446,6 @@ def show_chatbot_page():
     """Main chatbot interface"""
     st.markdown('<p class="main-header">💰 Financial Literacy Chatbot</p>', unsafe_allow_html=True)
     
-    # Progress indicator
     col1, col2, col3 = st.columns(3)
     with col1:
         st.success("✅ Pre-Test Complete")
@@ -402,7 +458,6 @@ def show_chatbot_page():
     
     st.divider()
     
-    # Display chat history
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
@@ -417,7 +472,6 @@ def show_chatbot_page():
                         st.caption(source["content"][:300] + "...")
                         st.divider()
     
-    # Chat input
     if prompt := st.chat_input("Ask about financial literacy..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
@@ -436,7 +490,6 @@ def show_chatbot_page():
                 
                 message_placeholder.markdown(full_response)
                 
-                # Feedback buttons
                 col1, col2, col3 = st.columns([1, 1, 4])
                 with col1:
                     if st.button("👍 Helpful", key=f"helpful_{len(st.session_state.messages)}"):
@@ -447,7 +500,6 @@ def show_chatbot_page():
                         save_feedback(prompt, full_response, "not_helpful", sources)
                         st.warning("We'll improve!")
                 
-                # Show sources
                 with st.expander("📚 View Sources"):
                     for i, source in enumerate(sources, 1):
                         metadata = source["metadata"]
@@ -510,13 +562,95 @@ def show_results_page():
     else:
         st.warning("Consider spending more time learning with the chatbot.")
     
+    st.divider()
+    
+    # Feedback Form
+    st.subheader("💭 We'd Love Your Feedback!")
+    
+    with st.form("feedback_form"):
+        st.write("Please share your experience with the Financial Literacy Chatbot:")
+        
+        rating = st.radio(
+            "How would you rate your overall experience?",
+            ["⭐ Excellent", "⭐ Good", "⭐ Average", "⭐ Poor"],
+            horizontal=True
+        )
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            helpful = st.select_slider(
+                "How helpful was the chatbot?",
+                options=["Not helpful", "Somewhat helpful", "Helpful", "Very helpful", "Extremely helpful"]
+            )
+        with col2:
+            easy_to_use = st.select_slider(
+                "How easy was it to use?",
+                options=["Very difficult", "Difficult", "Neutral", "Easy", "Very easy"]
+            )
+        
+        feedback_text = st.text_area(
+            "What did you like or dislike about the chatbot? Any suggestions for improvement?",
+            placeholder="Your feedback helps us improve...",
+            height=100
+        )
+        
+        topics = st.multiselect(
+            "Which topics did you find most useful? (Optional)",
+            ["Saving Money", "Budgeting", "EPF/KWSP", "Investing", "Debt Management", 
+             "Emergency Fund", "Credit Cards", "Insurance", "Other"]
+        )
+        
+        submitted = st.form_submit_button("📤 Submit Feedback", type="primary")
+        
+        if submitted:
+            if feedback_text.strip():
+                comprehensive_feedback = {
+                    "overall_rating": rating,
+                    "helpfulness": helpful,
+                    "ease_of_use": easy_to_use,
+                    "feedback_text": feedback_text,
+                    "useful_topics": topics
+                }
+                
+                save_general_feedback(
+                    st.session_state.user_id,
+                    str(comprehensive_feedback),
+                    rating.split()[1].lower()
+                )
+                
+                st.success("✅ Thank you for your feedback!")
+                st.balloons()
+            else:
+                st.warning("Please provide some feedback in the text area.")
+    
+    st.divider()
+    
     st.markdown("### 💡 Thank you for participating!")
     st.markdown("Your feedback helps us improve the chatbot for future users.")
+    
+    # New User Button
+    st.subheader("🔄 Next Steps")
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col2:
+        if st.button("👤 Start New User Session", type="primary", use_container_width=True):
+            reset_session()
+            st.rerun()
+    
+    st.caption("Click above to reset and allow another person to use the chatbot")
 
 # --- Admin Dashboard ---
 def show_admin_dashboard():
     """Admin page to view all user results"""
-    st.title("👨‍💼 Admin Dashboard")
+    # LOGOUT BUTTON
+    col1, col2, col3 = st.columns([4, 1, 1])
+    with col1:
+        st.title("👨‍💼 Admin Dashboard")
+    with col3:
+        if st.button("🚪 Logout", type="secondary"):
+            st.session_state.current_page = "welcome"
+            st.rerun()
+    
+    st.divider()
     
     tab1, tab2, tab3 = st.tabs(["📊 Test Results", "💬 Feedback", "📈 Analytics"])
     
@@ -524,7 +658,7 @@ def show_admin_dashboard():
         st.subheader("All Test Results")
         
         try:
-            with open("test_results.json", 'r', encoding='utf-8') as f:
+            with open("data/test_results.json", 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
             results = data.get("results", [])
@@ -534,10 +668,8 @@ def show_admin_dashboard():
             else:
                 st.metric("Total Participants", len(set(r["user_id"] for r in results)))
                 
-                # Filter options
                 test_type_filter = st.selectbox("Filter by test type:", ["All", "pre", "post"])
                 
-                # Display results
                 for result in results:
                     if test_type_filter != "All" and result["test_type"] != test_type_filter:
                         continue
@@ -568,7 +700,7 @@ def show_admin_dashboard():
         st.subheader("User Feedback")
         
         try:
-            with open("user_feedback.json", 'r', encoding='utf-8') as f:
+            with open("data/user_feedback.json", 'r', encoding='utf-8') as f:
                 feedback_data = json.load(f)
             
             feedbacks = feedback_data.get("feedback", [])
@@ -590,11 +722,20 @@ def show_admin_dashboard():
                 st.divider()
                 
                 for fb in feedbacks:
-                    with st.expander(f"{fb['rating'].title()} - {fb['timestamp'][:10]}"):
-                        st.write(f"**User:** {fb['user_id']}")
-                        st.write(f"**Question:** {fb['question']}")
-                        st.write(f"**Answer:** {fb['answer']}")
-                        st.write(f"**Sources Used:** {fb['sources_count']}")
+                    feedback_type = fb.get("feedback_type", "response")
+                    
+                    if feedback_type == "general":
+                        with st.expander(f"💭 General Feedback - {fb['timestamp'][:10]}"):
+                            st.write(f"**User:** {fb['user_id']}")
+                            st.write(f"**Rating:** {fb['rating'].upper()}")
+                            st.write(f"**Feedback:**")
+                            st.info(fb['feedback_text'])
+                    else:
+                        with st.expander(f"{fb['rating'].title()} - {fb['timestamp'][:10]}"):
+                            st.write(f"**User:** {fb['user_id']}")
+                            st.write(f"**Question:** {fb['question']}")
+                            st.write(f"**Answer:** {fb['answer']}")
+                            st.write(f"**Sources Used:** {fb['sources_count']}")
         
         except FileNotFoundError:
             st.error("No feedback file found.")
@@ -603,13 +744,12 @@ def show_admin_dashboard():
         st.subheader("Analytics")
         
         try:
-            with open("test_results.json", 'r', encoding='utf-8') as f:
+            with open("data/test_results.json", 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
             results = data.get("results", [])
             
             if results:
-                # Calculate average improvement
                 user_improvements = {}
                 
                 for result in results:
@@ -622,7 +762,6 @@ def show_admin_dashboard():
                     
                     user_improvements[user_id][test_type] = overall_score
                 
-                # Calculate improvements
                 improvements = []
                 for user_id, scores in user_improvements.items():
                     if "pre" in scores and "post" in scores:
@@ -652,7 +791,6 @@ def show_admin_dashboard():
 def main():
     """Main application"""
     
-    # Sidebar navigation
     with st.sidebar:
         st.title("📍 Navigation")
         
@@ -682,6 +820,19 @@ def main():
         
         st.divider()
         
+        # NEW USER RESET BUTTON
+        if st.button("🔄 New User", help="Reset for a new participant"):
+            if st.session_state.current_page not in ["welcome", "admin"]:
+                st.warning("⚠️ This will reset all progress!")
+                if st.button("✅ Confirm Reset"):
+                    reset_session()
+                    st.rerun()
+            else:
+                reset_session()
+                st.rerun()
+        
+        st.divider()
+        
         st.header("ℹ️ About")
         st.markdown("""
         This chatbot uses:
@@ -692,7 +843,6 @@ def main():
         
         st.divider()
         
-        # Admin access
         admin_password = st.text_input("Admin Access", type="password")
         if admin_password == "admin123":
             if st.button("📊 View Dashboard"):
