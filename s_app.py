@@ -179,19 +179,29 @@ def save_test_results(test_type, participant_info, responses, scores):
     }
     
     try:
-        with open(filename, 'r', encoding='utf-8') as f:
-            all_data = json.load(f)
-    except FileNotFoundError:
-        all_data = {"results": []}
-    
-    all_data["results"].append(result_data)
-    
-    with open(filename, 'w', encoding='utf-8') as f:
-        json.dump(all_data, f, indent=2, ensure_ascii=False)
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                all_data = json.load(f)
+        except FileNotFoundError:
+            all_data = {"results": []}
+        except Exception as e:
+            st.error(f"Error loading test results: {e}")
+            all_data = {"results": []}
+        
+        all_data["results"].append(result_data)
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(all_data, f, indent=2, ensure_ascii=False)
+        
+        print(f"✅ Saved {test_type} test for user {st.session_state.user_id}")
+    except Exception as e:
+        st.error(f"Error saving test results: {e}")
+        print(f"❌ Failed to save {test_type} test: {e}")
 
 def save_feedback(question, answer, rating, sources):
     """Save user feedback"""
     feedback_file = "data/user_feedback.json"
+    os.makedirs("data", exist_ok=True)
     
     feedback_entry = {
         "user_id": st.session_state.user_id,
@@ -204,19 +214,29 @@ def save_feedback(question, answer, rating, sources):
     }
     
     try:
-        with open(feedback_file, 'r', encoding='utf-8') as f:
-            feedback_data = json.load(f)
-    except FileNotFoundError:
-        feedback_data = {"feedback": []}
-    
-    feedback_data["feedback"].append(feedback_entry)
-    
-    with open(feedback_file, 'w', encoding='utf-8') as f:
-        json.dump(feedback_data, f, indent=2, ensure_ascii=False)
+        try:
+            with open(feedback_file, 'r', encoding='utf-8') as f:
+                feedback_data = json.load(f)
+        except FileNotFoundError:
+            feedback_data = {"feedback": []}
+        except Exception as e:
+            st.error(f"Error loading feedback: {e}")
+            feedback_data = {"feedback": []}
+        
+        feedback_data["feedback"].append(feedback_entry)
+        
+        with open(feedback_file, 'w', encoding='utf-8') as f:
+            json.dump(feedback_data, f, indent=2, ensure_ascii=False)
+        
+        print(f"✅ Saved feedback: {rating}")
+    except Exception as e:
+        st.error(f"Error saving feedback: {e}")
+        print(f"❌ Failed to save feedback: {e}")
 
 def save_general_feedback(user_id, feedback_text, rating):
     """Save general user feedback about the chatbot experience"""
     feedback_file = "data/user_feedback.json"
+    os.makedirs("data", exist_ok=True)
     
     feedback_entry = {
         "user_id": user_id,
@@ -230,15 +250,23 @@ def save_general_feedback(user_id, feedback_text, rating):
     }
     
     try:
-        with open(feedback_file, 'r', encoding='utf-8') as f:
-            feedback_data = json.load(f)
-    except FileNotFoundError:
-        feedback_data = {"feedback": []}
-    
-    feedback_data["feedback"].append(feedback_entry)
-    
-    with open(feedback_file, 'w', encoding='utf-8') as f:
-        json.dump(feedback_data, f, indent=2, ensure_ascii=False)
+        try:
+            with open(feedback_file, 'r', encoding='utf-8') as f:
+                feedback_data = json.load(f)
+        except FileNotFoundError:
+            feedback_data = {"feedback": []}
+        except Exception as e:
+            feedback_data = {"feedback": []}
+        
+        feedback_data["feedback"].append(feedback_entry)
+        
+        with open(feedback_file, 'w', encoding='utf-8') as f:
+            json.dump(feedback_data, f, indent=2, ensure_ascii=False)
+        
+        print(f"✅ Saved general feedback")
+    except Exception as e:
+        st.error(f"Error saving general feedback: {e}")
+        print(f"❌ Failed to save feedback: {e}")
 
 # --- Score Calculation ---
 def calculate_scores(responses):
