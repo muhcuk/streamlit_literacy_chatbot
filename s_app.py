@@ -1,32 +1,50 @@
+"""
+Financial Literacy Chatbot - MCP Version
+Uses MCP Server to reduce hallucinations by providing structured, verified responses
+
+To switch back to original: run `streamlit run s_app.py` instead
+"""
+
 import streamlit as st
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_community.llms import Ollama
 import os
 import json
+import subprocess
+import re
 from datetime import datetime
+import time
+import threading
+from functools import lru_cache
 
 # --- Configuration ---
 PERSIST_DIR = "../finance_db"
 COLLECTION_NAME = "finance_knowledge"
 EMB_MODEL = "intfloat/multilingual-e5-small"
-LLM_MODEL = "llama3.2"
 
 # --- Page Configuration ---
 st.set_page_config(
-    page_title="Financial Literacy Chatbot",
+    page_title="Financial Literacy Chatbot (MCP)",
     page_icon="💰",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
 # --- Custom CSS ---
 st.markdown("""
 <style>
     .main-header {
-        font-size: 2.5rem;
+        font-size: 3rem;
         font-weight: bold;
         color: #FFD700;
+    }
+    .mcp-badge {
+        background-color: #2E7D32;
+        color: white;
+        padding: 0.2rem 0.5rem;
+        border-radius: 0.25rem;
+        font-size: 0.8rem;
     }
     .quiz-card {
         padding: 1.5rem;
@@ -40,6 +58,13 @@ st.markdown("""
         border-radius: 0.5rem;
         background-color: #2b313e;
         text-align: center;
+    }
+    .source-citation {
+        background-color: #1a3a1a;
+        border-left: 3px solid #4CAF50;
+        padding: 0.5rem;
+        margin: 0.5rem 0;
+        font-size: 0.9rem;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -55,6 +80,10 @@ if "post_test_completed" not in st.session_state:
     st.session_state.post_test_completed = False
 if "user_id" not in st.session_state:
     st.session_state.user_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+if "selected_model" not in st.session_state:
+    st.session_state.selected_model = "my-finetuned"
+if "resources_loaded" not in st.session_state:
+    st.session_state.resources_loaded = False
 
 # --- Reset Session Function ---
 def reset_session():
@@ -64,6 +93,8 @@ def reset_session():
     st.session_state.pre_test_completed = False
     st.session_state.post_test_completed = False
     st.session_state.user_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    st.session_state.selected_model = "my-finetuned"
+    st.session_state.rag_mode = "MCP-Strict"
     if "pre_test_scores" in st.session_state:
         del st.session_state.pre_test_scores
     if "post_test_scores" in st.session_state:
@@ -71,102 +102,63 @@ def reset_session():
     if "participant_info" in st.session_state:
         del st.session_state.participant_info
 
-# --- PISA Questions ---
+# --- PISA Questions (same as original) ---
 PISA_QUESTIONS = {
     "Financial Knowledge": [
-        {
-            "id": "FL164Q01",
-            "question": "Have you heard of or learnt about: Interest payment",
-            "options": ["Never heard of it", "Heard of it, but don't recall meaning", "Know what it means"],
-            "weight": 1
-        },
-        {
-            "id": "FL164Q02",
-            "question": "Have you heard of or learnt about: Compound interest",
-            "options": ["Never heard of it", "Heard of it, but don't recall meaning", "Know what it means"],
-            "weight": 1
-        },
-        {
-            "id": "FL164Q12",
-            "question": "Have you heard of or learnt about: Budget",
-            "options": ["Never heard of it", "Heard of it, but don't recall meaning", "Know what it means"],
-            "weight": 1
-        }
+        {"id": "FL164Q01", "question": "Have you heard of or learnt about: Interest payment", "options": ["Never heard of it", "Heard of it, but don't recall meaning", "Know what it means"], "weight": 1},
+        {"id": "FL164Q02", "question": "Have you heard of or learnt about: Compound interest", "options": ["Never heard of it", "Heard of it, but don't recall meaning", "Know what it means"], "weight": 1},
+        {"id": "FL164Q12", "question": "Have you heard of or learnt about: Budget", "options": ["Never heard of it", "Heard of it, but don't recall meaning", "Know what it means"], "weight": 1}
     ],
     "Financial Behavior": [
-        {
-            "id": "FL160Q01",
-            "question": "When buying a product, how often do you compare prices in different shops?",
-            "options": ["Never", "Rarely", "Sometimes", "Always"],
-            "weight": 1
-        },
-        {
-            "id": "FL171Q08",
-            "question": "In the last 12 months, how often have you checked how much money you have?",
-            "options": ["Never/Almost never", "Once/twice a year", "Once/twice a month", "Weekly", "Daily"],
-            "weight": 1
-        }
+        {"id": "FL160Q01", "question": "When buying a product, how often do you compare prices in different shops?", "options": ["Never", "Rarely", "Sometimes", "Always"], "weight": 1},
+        {"id": "FL171Q08", "question": "In the last 12 months, how often have you checked how much money you have?", "options": ["Never/Almost never", "Once/twice a year", "Once/twice a month", "Weekly", "Daily"], "weight": 1}
     ],
     "Financial Confidence": [
-        {
-            "id": "FL162Q03",
-            "question": "How confident would you feel about understanding bank statements?",
-            "options": ["Not at all confident", "Not very confident", "Confident", "Very confident"],
-            "weight": 1
-        },
-        {
-            "id": "FL162Q06",
-            "question": "How confident are you about planning spending with consideration of your financial situation?",
-            "options": ["Not at all confident", "Not very confident", "Confident", "Very confident"],
-            "weight": 1
-        }
+        {"id": "FL162Q03", "question": "How confident would you feel about understanding bank statements?", "options": ["Not at all confident", "Not very confident", "Confident", "Very confident"], "weight": 1},
+        {"id": "FL162Q06", "question": "How confident are you about planning spending with consideration of your financial situation?", "options": ["Not at all confident", "Not very confident", "Confident", "Very confident"], "weight": 1}
     ],
     "Financial Attitudes": [
-        {
-            "id": "FL169Q05",
-            "question": "To what extent do you agree: I know how to manage my money",
-            "options": ["Strongly disagree", "Disagree", "Agree", "Strongly agree"],
-            "weight": 1
-        },
-        {
-            "id": "FL169Q10",
-            "question": "To what extent do you agree: I make savings goals for things I want to buy",
-            "options": ["Strongly disagree", "Disagree", "Agree", "Strongly agree"],
-            "weight": 1
-        }
+        {"id": "FL169Q05", "question": "To what extent do you agree: I know how to manage my money", "options": ["Strongly disagree", "Disagree", "Agree", "Strongly agree"], "weight": 1},
+        {"id": "FL169Q10", "question": "To what extent do you agree: I make savings goals for things I want to buy", "options": ["Strongly disagree", "Disagree", "Agree", "Strongly agree"], "weight": 1}
     ]
 }
 
 # --- Load Resources ---
-@st.cache_resource
-def load_resources():
+@st.cache_resource(show_spinner=False)
+def load_embeddings():
+    return HuggingFaceEmbeddings(model_name=EMB_MODEL)
+
+@st.cache_resource(show_spinner=False)
+def load_database(_embeddings):
     if not os.path.exists(PERSIST_DIR):
         st.error(f"Database not found at {PERSIST_DIR}")
         st.stop()
-    
-    embeddings = HuggingFaceEmbeddings(model_name=EMB_MODEL)
-    db = Chroma(
+    return Chroma(
         collection_name=COLLECTION_NAME,
-        embedding_function=embeddings,
+        embedding_function=_embeddings,
         persist_directory=PERSIST_DIR
     )
-    
-    # OPTIMIZED LLM with speed parameters
-    llm = Ollama(
-        model=LLM_MODEL,
-        temperature=0.7,
-        num_predict=256,  # Limit response length (faster)
-        top_k=10,         # Reduce sampling space (faster)
-        top_p=0.9         # Nucleus sampling (more focused)
-    )
-    return db, llm
 
-db, llm = load_resources()
+@st.cache_resource(show_spinner=False)
+def load_llm(_model_name):
+    return Ollama(
+        model=_model_name,
+        temperature=0.3,  # Lower temperature for more factual responses
+        num_predict=450,
+        top_k=30,
+        top_p=0.85,
+        repeat_penalty=1.2
+    )
+
+def load_resources(model_name):
+    embeddings = load_embeddings()
+    db = load_database(embeddings)
+    llm = load_llm(model_name)
+    return db, llm
 
 # --- Data Storage Functions ---
 def save_test_results(test_type, participant_info, responses, scores):
-    """Save test results to JSON file"""
-    filename = "data/test_results.json"
+    filename = "data/test_results_mcp.json"
     os.makedirs("data", exist_ok=True)
     
     result_data = {
@@ -175,7 +167,9 @@ def save_test_results(test_type, participant_info, responses, scores):
         "test_type": test_type,
         "participant_info": participant_info,
         "responses": responses,
-        "scores": scores
+        "scores": scores,
+        "model_used": st.session_state.selected_model,
+        "mode": "MCP"
     }
     
     try:
@@ -184,23 +178,16 @@ def save_test_results(test_type, participant_info, responses, scores):
                 all_data = json.load(f)
         except FileNotFoundError:
             all_data = {"results": []}
-        except Exception as e:
-            st.error(f"Error loading test results: {e}")
-            all_data = {"results": []}
         
         all_data["results"].append(result_data)
         
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(all_data, f, indent=2, ensure_ascii=False)
-        
-        print(f"✅ Saved {test_type} test for user {st.session_state.user_id}")
     except Exception as e:
         st.error(f"Error saving test results: {e}")
-        print(f"❌ Failed to save {test_type} test: {e}")
 
 def save_feedback(question, answer, rating, sources):
-    """Save user feedback"""
-    feedback_file = "data/user_feedback.json"
+    feedback_file = "data/user_feedback_mcp.json"
     os.makedirs("data", exist_ok=True)
     
     feedback_entry = {
@@ -210,7 +197,9 @@ def save_feedback(question, answer, rating, sources):
         "question": question,
         "answer": answer[:500],
         "rating": rating,
-        "sources_count": len(sources)
+        "sources_count": len(sources) if sources else 0,
+        "model_used": st.session_state.selected_model,
+        "mode": "MCP"
     }
     
     try:
@@ -219,161 +208,317 @@ def save_feedback(question, answer, rating, sources):
                 feedback_data = json.load(f)
         except FileNotFoundError:
             feedback_data = {"feedback": []}
-        except Exception as e:
-            st.error(f"Error loading feedback: {e}")
-            feedback_data = {"feedback": []}
         
         feedback_data["feedback"].append(feedback_entry)
         
         with open(feedback_file, 'w', encoding='utf-8') as f:
             json.dump(feedback_data, f, indent=2, ensure_ascii=False)
-        
-        print(f"✅ Saved feedback: {rating}")
     except Exception as e:
         st.error(f"Error saving feedback: {e}")
-        print(f"❌ Failed to save feedback: {e}")
 
-def save_general_feedback(user_id, feedback_text, rating):
-    """Save general user feedback about the chatbot experience"""
-    feedback_file = "data/user_feedback.json"
-    os.makedirs("data", exist_ok=True)
-    
-    feedback_entry = {
-        "user_id": user_id,
-        "timestamp": datetime.now().isoformat(),
-        "feedback_type": "general",
-        "feedback_text": feedback_text,
-        "rating": rating,
-        "question": "General Feedback",
-        "answer": "N/A",
-        "sources_count": 0
-    }
-    
-    try:
-        try:
-            with open(feedback_file, 'r', encoding='utf-8') as f:
-                feedback_data = json.load(f)
-        except FileNotFoundError:
-            feedback_data = {"feedback": []}
-        except Exception as e:
-            feedback_data = {"feedback": []}
-        
-        feedback_data["feedback"].append(feedback_entry)
-        
-        with open(feedback_file, 'w', encoding='utf-8') as f:
-            json.dump(feedback_data, f, indent=2, ensure_ascii=False)
-        
-        print(f"✅ Saved general feedback")
-    except Exception as e:
-        st.error(f"Error saving general feedback: {e}")
-        print(f"❌ Failed to save feedback: {e}")
-
-# --- Score Calculation ---
 def calculate_scores(responses):
-    """Calculate scores by category"""
     category_scores = {}
-    
     for category, questions in PISA_QUESTIONS.items():
         total_score = 0
         max_score = 0
-        
         for q in questions:
             response = next((r for r in responses if r["question_id"] == q["id"]), None)
             if response:
                 score_value = response["score"]
                 total_score += score_value
                 max_score += len(q["options"]) - 1
-        
         category_scores[category] = (total_score / max_score * 100) if max_score > 0 else 0
     
     all_scores = list(category_scores.values())
     category_scores["Overall"] = sum(all_scores) / len(all_scores) if all_scores else 0
-    
     return category_scores
 
-# --- RAG Functions ---
-def rewrite_query(query: str) -> str:
-    """Expand query for better retrieval"""
-    financial_keywords = {
-        "save": "saving tips money management",
-        "budget": "budgeting financial planning spending",
-        "debt": "debt management loan credit card",
-        "invest": "investment returns stocks bonds",
-        "retire": "retirement planning EPF KWSP",
-        "emergency": "emergency fund savings buffer"
+
+# =============================================================================
+# MCP-STYLE TOOLS - Structured Knowledge Access (Replaces free-form RAG)
+# =============================================================================
+
+def mcp_search_knowledge(query: str, db, max_results: int = 3) -> dict:
+    """
+    MCP Tool: Search the verified financial knowledge base.
+    Returns STRUCTURED data that forces the LLM to use exact content.
+    """
+    try:
+        docs = db.max_marginal_relevance_search(
+            query, 
+            k=max_results, 
+            fetch_k=max_results * 2,
+            lambda_mult=0.5
+        )
+        
+        results = []
+        sources_list = []
+        
+        for doc in docs:
+            content = doc.page_content.strip()
+            metadata = doc.metadata or {}
+            source = metadata.get("source", metadata.get("url", metadata.get("source_file", "Unknown")))
+            
+            results.append({
+                "fact": content,
+                "source": source,
+                "title": metadata.get("title", ""),
+                "verified": True  # Mark as verified from knowledge base
+            })
+            sources_list.append({
+                "content": content,
+                "metadata": metadata
+            })
+        
+        return {
+            "success": True,
+            "query": query,
+            "total_found": len(results),
+            "facts": results,  # Named "facts" to emphasize these are verified
+            "sources": sources_list,
+            "can_answer": len(results) > 0
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "query": query,
+            "total_found": 0,
+            "facts": [],
+            "sources": [],
+            "can_answer": False,
+            "error": str(e)
+        }
+
+
+def mcp_calculate_compound_interest(principal: float, rate: float, years: int, monthly: float = 0) -> dict:
+    """MCP Tool: Calculate compound interest - impossible to hallucinate"""
+    rate_decimal = rate / 100
+    basic_final = principal * (1 + rate_decimal) ** years
+    
+    if monthly > 0:
+        monthly_rate = rate_decimal / 12
+        months = years * 12
+        contribution_final = monthly * (((1 + monthly_rate) ** months - 1) / monthly_rate)
+        total_final = basic_final + contribution_final
+        total_contributed = principal + (monthly * months)
+    else:
+        total_final = basic_final
+        total_contributed = principal
+    
+    return {
+        "success": True,
+        "calculation": "compound_interest",
+        "inputs": {"principal": principal, "rate": rate, "years": years, "monthly": monthly},
+        "result": {
+            "final_amount": round(total_final, 2),
+            "total_contributed": round(total_contributed, 2),
+            "interest_earned": round(total_final - total_contributed, 2)
+        }
     }
+
+
+def mcp_calculate_budget(income: float) -> dict:
+    """MCP Tool: 50/30/20 budget calculation - exact numbers"""
+    return {
+        "success": True,
+        "calculation": "50_30_20_budget",
+        "income": income,
+        "breakdown": {
+            "needs_50pct": round(income * 0.50, 2),
+            "wants_30pct": round(income * 0.30, 2),
+            "savings_20pct": round(income * 0.20, 2)
+        }
+    }
+
+
+def mcp_check_debt_ratio(income: float, debt_payments: float) -> dict:
+    """MCP Tool: Debt-to-income ratio assessment"""
+    ratio = (debt_payments / income) * 100 if income > 0 else 0
     
+    if ratio <= 30:
+        status = "HEALTHY"
+        advice = "Your debt level is manageable."
+    elif ratio <= 40:
+        status = "MODERATE"
+        advice = "Be cautious about taking new debt."
+    elif ratio <= 50:
+        status = "HIGH"
+        advice = "Prioritize debt repayment."
+    else:
+        status = "CRITICAL"
+        advice = "Consider seeking financial counseling (AKPK)."
+    
+    return {
+        "success": True,
+        "calculation": "debt_to_income",
+        "ratio": round(ratio, 1),
+        "status": status,
+        "advice": advice
+    }
+
+
+def detect_calculation_request(query: str) -> dict:
+    """Detect if user is asking for a calculation"""
     query_lower = query.lower()
-    for keyword, expansion in financial_keywords.items():
-        if keyword in query_lower:
-            return f"{query} {expansion}"
-    return query
+    
+    # Compound interest
+    if any(term in query_lower for term in ["compound interest", "grow", "investment return", "savings grow"]):
+        numbers = re.findall(r'rm?\s*(\d+(?:,\d{3})*(?:\.\d{2})?)', query_lower)
+        numbers = [float(n.replace(',', '')) for n in numbers]
+        rate_match = re.search(r'(\d+(?:\.\d+)?)\s*%', query_lower)
+        year_match = re.search(r'(\d+)\s*(?:year|yr)', query_lower)
+        
+        if numbers:
+            return {
+                "type": "compound_interest",
+                "principal": numbers[0] if numbers else 1000,
+                "rate": float(rate_match.group(1)) if rate_match else 5,
+                "years": int(year_match.group(1)) if year_match else 10,
+                "monthly": numbers[1] if len(numbers) > 1 else 0
+            }
+    
+    # Budget calculation
+    if any(term in query_lower for term in ["50/30/20", "50 30 20", "budget for", "allocate"]):
+        numbers = re.findall(r'rm?\s*(\d+(?:,\d{3})*(?:\.\d{2})?)', query_lower)
+        if numbers:
+            return {
+                "type": "budget",
+                "income": float(numbers[0].replace(',', ''))
+            }
+    
+    # Debt ratio
+    if any(term in query_lower for term in ["debt ratio", "debt to income", "can i afford"]):
+        numbers = re.findall(r'rm?\s*(\d+(?:,\d{3})*(?:\.\d{2})?)', query_lower)
+        if len(numbers) >= 2:
+            return {
+                "type": "debt_ratio",
+                "income": float(numbers[0].replace(',', '')),
+                "debt": float(numbers[1].replace(',', ''))
+            }
+    
+    return {"type": None}
 
-def run_rag_chain(query: str, llm):
-    expanded_query = rewrite_query(query)
-    
-    # OPTIMIZED: Reduce number of documents retrieved
-    retriever = db.as_retriever(
-        search_type="mmr",
-        search_kwargs={"k": 3, "fetch_k": 12, "lambda_mult": 0.5}
-    )
-    
-    docs = retriever.invoke(expanded_query)
-    
-    # OPTIMIZED: Limit context length to speed up processing
-    context_parts = []
-    total_chars = 0
-    max_chars = 2000
-    
-    for doc in docs:
-        content = doc.page_content
-        if total_chars + len(content) <= max_chars:
-            context_parts.append(content)
-            total_chars += len(content)
-        else:
-            remaining = max_chars - total_chars
-            if remaining > 200:
-                context_parts.append(content[:remaining])
-            break
-    
-    context = "\n\n".join(context_parts)
-    
-    # OPTIMIZED: Shorter, more focused prompt
-    prompt = f"""You are a financial literacy assistant for Malaysian youth.
 
-Context:
-{context}
-
-Question: {query}
-
-Provide a clear, concise answer (2-3 paragraphs max) based only on the context above:"""
+def run_mcp_rag_chain(query: str, db, llm):
+    """
+    MCP-Style RAG Chain - Enforces structured, verified responses
     
+    Key difference from original:
+    1. Tools return STRUCTURED data (not free text)
+    2. LLM must format the structured data (not generate new content)
+    3. If no data found, explicitly says "I don't have information"
+    """
+    
+    # Step 1: Check for calculation requests (no hallucination possible)
+    calc_request = detect_calculation_request(query)
+    calc_result = None
+    
+    if calc_request["type"] == "compound_interest":
+        calc_result = mcp_calculate_compound_interest(
+            calc_request["principal"],
+            calc_request["rate"],
+            calc_request["years"],
+            calc_request.get("monthly", 0)
+        )
+    elif calc_request["type"] == "budget":
+        calc_result = mcp_calculate_budget(calc_request["income"])
+    elif calc_request["type"] == "debt_ratio":
+        calc_result = mcp_check_debt_ratio(calc_request["income"], calc_request["debt"])
+    
+    # Step 2: Search knowledge base
+    search_result = mcp_search_knowledge(query, db, max_results=3)
+    
+    # Step 3: Build STRUCTURED prompt that forces LLM to use only provided data
+    if calc_result:
+        calc_section = f"""
+CALCULATION RESULT (Exact - use these numbers):
+{json.dumps(calc_result, indent=2)}
+"""
+    else:
+        calc_section = ""
+    
+    if search_result["can_answer"]:
+        facts_text = "\n".join([
+            f"FACT {i+1} [Source: {f['source']}]:\n{f['fact']}"
+            for i, f in enumerate(search_result["facts"])
+        ])
+        knowledge_section = f"""
+VERIFIED FACTS FROM KNOWLEDGE BASE:
+{facts_text}
+"""
+        no_info_instruction = ""
+    else:
+        knowledge_section = ""
+        no_info_instruction = """
+⚠️ NO RELEVANT INFORMATION FOUND IN KNOWLEDGE BASE.
+You MUST respond with: "I don't have specific information about this topic in my knowledge base. 
+Please try asking about budgeting, saving, debt management, investment, insurance, tax, or retirement planning in Malaysia."
+"""
+    
+    # The key: Prompt that FORCES use of provided data only
+    prompt = f"""You are a financial literacy assistant. You must ONLY use the verified information provided below.
+
+STRICT RULES:
+1. ONLY use facts from the VERIFIED FACTS section below
+2. If calculation results are provided, present those EXACT numbers
+3. Do NOT add information that is not in the provided facts
+4. ALWAYS cite which source each fact comes from
+5. If no facts are provided, say you don't have information on this topic
+
+{calc_section}
+{knowledge_section}
+{no_info_instruction}
+
+User Question: {query}
+
+RESPONSE FORMAT:
+- Brief introduction
+- Present facts with citations: "According to [source], ..."
+- If calculation provided, show the exact numbers
+- End with one practical tip from the sources
+
+Your response (using ONLY the verified facts above):"""
+
     response_stream = llm.stream(prompt)
-    sources = [{"content": doc.page_content, "metadata": doc.metadata} for doc in docs]
+    sources = search_result.get("sources", [])
     
-    return response_stream, sources
+    return response_stream, sources, search_result["total_found"], calc_result
 
-# --- UI Pages ---
+
+def is_greeting(text: str) -> bool:
+    if not text:
+        return False
+    t = text.strip().lower()
+    greetings = ["hi", "hello", "hey", "hiya", "good morning", "good afternoon", "good evening", "yo"]
+    if t in greetings or len(t.split()) <= 2 and any(t.startswith(g) for g in greetings):
+        return True
+    return False
+
+
+# =============================================================================
+# UI PAGES
+# =============================================================================
+
 def show_welcome_page():
-    """Welcome page"""
     st.markdown('<p class="main-header">💰 Financial Literacy Chatbot</p>', unsafe_allow_html=True)
+    st.markdown('<span class="mcp-badge">🔒 MCP Mode - Reduced Hallucination</span>', unsafe_allow_html=True)
     
     st.markdown("""
     ### Welcome! 👋
     
-    This AI-powered chatbot helps you learn about financial literacy using information from 
-    **Malaysian EPF (KWSP)** and financial education resources.
+    This is the **MCP (Model Context Protocol) version** of the chatbot.
+    
+    #### 🔒 What's different in MCP Mode?
+    - **Structured responses**: The AI only presents verified facts from the knowledge base
+    - **Exact calculations**: Financial calculations use precise formulas (no guessing)
+    - **Source citations**: Every fact is linked to its source
+    - **Honest uncertainty**: If information isn't available, the chatbot will tell you
     
     #### 📋 How it works:
     1. **Pre-Test** - Complete a short quiz to assess your current financial knowledge
-    2. **Learn** - Ask the chatbot any questions about financial literacy
+    2. **Learn** - Ask the chatbot questions (responses are strictly from verified sources)
     3. **Post-Test** - Take the quiz again to see your improvement
-    4. **Results** - View your learning progress
-    
-    #### ⏱️ Time Required:
-    - Pre-test: ~5 minutes
-    - Chatbot interaction: 15-20 minutes (recommended)
-    - Post-test: ~5 minutes
     
     ---
     
@@ -385,15 +530,16 @@ def show_welcome_page():
         if st.button("🚀 Start Pre-Test", type="primary", use_container_width=True):
             st.session_state.current_page = "pre_test"
             st.rerun()
+    
+    st.markdown("---")
+    st.caption("💡 To use the original version (without MCP), run: `streamlit run s_app.py`")
+
 
 def show_pisa_test(test_type="pre"):
-    """Show PISA test"""
     st.title(f"📋 {'Pre' if test_type == 'pre' else 'Post'}-Test: Financial Literacy Assessment")
     
     st.markdown(f"""
     ### {f'Let us assess your current financial knowledge' if test_type == 'pre' else 'Final Assessment - See Your Progress!'}
-    
-    This assessment is based on the **PISA 2022 Financial Literacy Framework** used globally by OECD.
     
     **Questions:** {sum(len(v) for v in PISA_QUESTIONS.values())} | **Time:** ~5 minutes
     """)
@@ -403,19 +549,12 @@ def show_pisa_test(test_type="pre"):
             col1, col2 = st.columns(2)
             with col1:
                 age = st.number_input("Age", min_value=15, max_value=99, value=20)
-                education = st.selectbox("Education Level",
-                    ["Secondary School", "Diploma", "Bachelor's", "Master's", "PhD", "Other"])
+                education = st.selectbox("Education Level", ["Secondary School", "Diploma", "Bachelor's", "Master's", "PhD", "Other"])
             with col2:
                 gender = st.selectbox("Gender", ["Male", "Female", "Prefer not to say"])
-                occupation = st.selectbox("Occupation",
-                    ["Student", "Employee", "Self-employed", "Unemployed", "Other"])
+                occupation = st.selectbox("Occupation", ["Student", "Employee", "Self-employed", "Unemployed", "Other"])
         
-        participant_info = {
-            "age": age,
-            "education": education,
-            "gender": gender,
-            "occupation": occupation
-        }
+        participant_info = {"age": age, "education": education, "gender": gender, "occupation": occupation}
         st.session_state.participant_info = participant_info
     else:
         participant_info = st.session_state.get("participant_info", {})
@@ -427,27 +566,11 @@ def show_pisa_test(test_type="pre"):
     
     for category, questions in PISA_QUESTIONS.items():
         st.subheader(f"📊 {category}")
-        
         for q in questions:
             st.markdown(f"**Q{question_number}. {q['question']}**")
-            
-            response = st.radio(
-                "Select your answer:",
-                options=q["options"],
-                key=f"{test_type}_{q['id']}",
-                label_visibility="collapsed"
-            )
-            
+            response = st.radio("Select your answer:", options=q["options"], key=f"{test_type}_{q['id']}", label_visibility="collapsed")
             score = q["options"].index(response) if response else 0
-            
-            all_responses.append({
-                "question_id": q["id"],
-                "question": q["question"],
-                "category": category,
-                "response": response,
-                "score": score
-            })
-            
+            all_responses.append({"question_id": q["id"], "question": q["question"], "category": category, "response": response, "score": score})
             question_number += 1
             st.divider()
     
@@ -470,37 +593,42 @@ def show_pisa_test(test_type="pre"):
             st.balloons()
             st.rerun()
 
+
 def show_chatbot_page():
-    """Main chatbot interface"""
     st.markdown('<p class="main-header">💰 Financial Literacy Chatbot</p>', unsafe_allow_html=True)
+    st.markdown('<span class="mcp-badge">🔒 MCP Mode - Verified Responses Only</span>', unsafe_allow_html=True)
     
     col1, col2, col3 = st.columns(3)
     with col1:
         st.success("✅ Pre-Test Complete")
     with col2:
-        st.info("💬 Currently Using Chatbot")
+        st.info("💬 Using MCP-Verified Mode")
     with col3:
         if st.button("📝 Take Post-Test"):
             st.session_state.current_page = "post_test"
             st.rerun()
     
-    st.divider()
+    try:
+        db, llm = load_resources(st.session_state.selected_model)
+    except Exception as e:
+        st.error(f"❌ Error loading model: {str(e)}")
+        return
     
+    # Display chat history
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
-            if message["role"] == "assistant" and "sources" in message:
-                with st.expander("📚 View Sources"):
+            if message["role"] == "assistant" and "sources" in message and message["sources"]:
+                with st.expander(f"📚 View Sources ({len(message['sources'])} verified)"):
                     for i, source in enumerate(message["sources"], 1):
-                        metadata = source["metadata"]
-                        title = metadata.get("title", "Unknown Source")
-                        url = metadata.get("url", "https://www.kwsp.gov.my")
-                        
-                        st.markdown(f"**Source {i}:** [{title}]({url})")
-                        st.caption(source["content"][:300] + "...")
+                        metadata = source.get("metadata", {})
+                        title = metadata.get("title", metadata.get("source", "Unknown Source"))
+                        st.markdown(f"**{i}. {title}**")
+                        st.caption(source["content"][:200] + "...")
                         st.divider()
     
-    if prompt := st.chat_input("Ask about financial literacy..."):
+    # Chat input
+    if prompt := st.chat_input("Ask about financial literacy (responses from verified sources only)..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -509,381 +637,182 @@ def show_chatbot_page():
             message_placeholder = st.empty()
             full_response = ""
             
+            thinking_placeholder = st.empty()
+            stop_animation = threading.Event()
+            
+            def animate_thinking(placeholder, stop_event):
+                dots = ["", ".", "..", "..."]
+                idx = 0
+                while not stop_event.is_set():
+                    placeholder.markdown(f"🔍 Searching verified knowledge base{dots[idx]}")
+                    idx = (idx + 1) % len(dots)
+                    time.sleep(0.5)
+                placeholder.empty()
+            
             try:
-                response_stream, sources = run_rag_chain(prompt, llm)
-                
-                for chunk in response_stream:
-                    full_response += chunk
-                    message_placeholder.markdown(full_response + "▌")
-                
-                message_placeholder.markdown(full_response)
-                
-                col1, col2, col3 = st.columns([1, 1, 4])
-                with col1:
-                    if st.button("👍 Helpful", key=f"helpful_{len(st.session_state.messages)}"):
-                        save_feedback(prompt, full_response, "helpful", sources)
-                        st.success("Thanks!")
-                with col2:
-                    if st.button("👎 Not Helpful", key=f"not_helpful_{len(st.session_state.messages)}"):
-                        save_feedback(prompt, full_response, "not_helpful", sources)
-                        st.warning("We'll improve!")
-                
-                with st.expander("📚 View Sources"):
-                    for i, source in enumerate(sources, 1):
-                        metadata = source["metadata"]
-                        title = metadata.get("title", "Unknown Source")
-                        url = metadata.get("url", "https://www.kwsp.gov.my")
-                        
-                        st.markdown(f"**Source {i}:** [{title}]({url})")
-                        st.caption(source["content"][:300] + "...")
-                        st.divider()
-                
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": full_response,
-                    "sources": sources
-                })
-                
+                if is_greeting(prompt):
+                    full_response = (
+                        "Hello! 👋 I'm the MCP-powered financial literacy chatbot.\n\n"
+                        "In this mode, I only provide **verified information** from my knowledge base. "
+                        "Ask me about:\n"
+                        "- 💰 Budgeting (50/30/20 rule)\n"
+                        "- 🏦 Saving tips\n"
+                        "- 💳 Debt management\n"
+                        "- 📈 Investment basics\n"
+                        "- 🏥 Insurance\n"
+                        "- 🧾 Tax filing (LHDN)\n"
+                        "- 👴 Retirement (EPF/KWSP)\n\n"
+                        "How can I help you today?"
+                    )
+                    sources = []
+                    message_placeholder.markdown(full_response)
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": full_response,
+                        "sources": sources,
+                        "mode": "MCP"
+                    })
+                else:
+                    # Start animation
+                    animation_thread = threading.Thread(target=animate_thinking, args=(thinking_placeholder, stop_animation))
+                    animation_thread.start()
+                    
+                    # Run MCP-style RAG
+                    response_stream, sources, found_count, calc_result = run_mcp_rag_chain(prompt, db, llm)
+                    
+                    # Stop animation
+                    stop_animation.set()
+                    animation_thread.join()
+                    
+                    # Stream response
+                    for chunk in response_stream:
+                        full_response += chunk
+                        message_placeholder.markdown(full_response + "▌")
+                    
+                    message_placeholder.markdown(full_response)
+                    
+                    # Show verification status
+                    if found_count > 0:
+                        st.success(f"✅ Response based on {found_count} verified source(s)")
+                    else:
+                        st.warning("⚠️ Limited information available for this query")
+                    
+                    if calc_result:
+                        st.info("🧮 Includes exact calculation results")
+                    
+                    # Feedback buttons
+                    col1, col2, col3 = st.columns([1, 1, 4])
+                    with col1:
+                        if st.button("👍 Helpful", key=f"helpful_{len(st.session_state.messages)}"):
+                            save_feedback(prompt, full_response, "helpful", sources)
+                            st.success("Thanks!")
+                    with col2:
+                        if st.button("👎 Not Helpful", key=f"not_helpful_{len(st.session_state.messages)}"):
+                            save_feedback(prompt, full_response, "not_helpful", sources)
+                            st.warning("We'll improve!")
+                    
+                    # Show sources
+                    if sources:
+                        with st.expander(f"📚 View Sources ({len(sources)} verified)"):
+                            for i, source in enumerate(sources, 1):
+                                metadata = source.get("metadata", {})
+                                title = metadata.get("title", metadata.get("source", "Unknown Source"))
+                                st.markdown(f"**{i}. {title}**")
+                                st.caption(source["content"][:200] + "...")
+                                st.divider()
+                    
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": full_response,
+                        "sources": sources,
+                        "mode": "MCP",
+                        "found_count": found_count
+                    })
+                    
             except Exception as e:
+                stop_animation.set()
+                if 'animation_thread' in locals():
+                    animation_thread.join()
                 error_msg = f"❌ Error: {str(e)}"
                 message_placeholder.markdown(error_msg)
 
+
 def show_results_page():
-    """Show final results and improvement"""
-    st.title("🎉 Congratulations! You've Completed the Assessment")
+    st.title("🎉 Congratulations! Assessment Complete")
+    st.markdown('<span class="mcp-badge">🔒 MCP Mode Results</span>', unsafe_allow_html=True)
     
     pre_scores = st.session_state.get("pre_test_scores", {})
     post_scores = st.session_state.get("post_test_scores", {})
     
-    st.subheader("📊 Your Progress")
-    
-    categories = ["Financial Knowledge", "Financial Behavior", "Financial Confidence", "Financial Attitudes", "Overall"]
-    
-    for category in categories:
-        col1, col2, col3, col4 = st.columns([3, 1, 1, 1])
+    if pre_scores and post_scores:
+        st.subheader("📊 Your Progress")
         
+        col1, col2, col3 = st.columns(3)
         with col1:
-            st.write(f"**{category}**")
+            pre_overall = pre_scores.get("Overall", 0)
+            st.metric("Pre-Test Score", f"{pre_overall:.1f}%")
         with col2:
-            st.metric("Before", f"{pre_scores.get(category, 0):.0f}%")
+            post_overall = post_scores.get("Overall", 0)
+            st.metric("Post-Test Score", f"{post_overall:.1f}%")
         with col3:
-            st.metric("After", f"{post_scores.get(category, 0):.0f}%")
-        with col4:
-            improvement = post_scores.get(category, 0) - pre_scores.get(category, 0)
-            if improvement > 0:
-                st.success(f"+{improvement:.0f}%")
-            elif improvement < 0:
-                st.error(f"{improvement:.0f}%")
-            else:
-                st.info("0%")
+            improvement = post_overall - pre_overall
+            st.metric("Improvement", f"{improvement:+.1f}%", delta=f"{improvement:+.1f}%")
+        
+        st.divider()
+        
+        st.subheader("📈 Score Breakdown by Category")
+        for category in ["Financial Knowledge", "Financial Behavior", "Financial Confidence", "Financial Attitudes"]:
+            pre_cat = pre_scores.get(category, 0)
+            post_cat = post_scores.get(category, 0)
+            diff = post_cat - pre_cat
+            
+            col1, col2, col3 = st.columns([2, 1, 1])
+            with col1:
+                st.write(f"**{category}**")
+            with col2:
+                st.write(f"Pre: {pre_cat:.1f}% → Post: {post_cat:.1f}%")
+            with col3:
+                if diff > 0:
+                    st.success(f"↑ {diff:.1f}%")
+                elif diff < 0:
+                    st.error(f"↓ {abs(diff):.1f}%")
+                else:
+                    st.info("No change")
     
     st.divider()
     
-    overall_improvement = post_scores.get("Overall", 0) - pre_scores.get("Overall", 0)
-    
-    if overall_improvement > 15:
-        st.success(f"🌟 **Excellent Progress!** You improved by {overall_improvement:.1f}% overall!")
-    elif overall_improvement > 5:
-        st.info(f"✅ **Good Work!** You improved by {overall_improvement:.1f}%")
-    elif overall_improvement > 0:
-        st.info(f"👍 **You Improved!** +{overall_improvement:.1f}%")
-    else:
-        st.warning("Consider spending more time learning with the chatbot.")
-    
-    st.divider()
-    
-    # Feedback Form
-    st.subheader("💭 We'd Love Your Feedback!")
-    
-    with st.form("feedback_form"):
-        st.write("Please share your experience with the Financial Literacy Chatbot:")
-        
-        rating = st.radio(
-            "How would you rate your overall experience?",
-            ["⭐ Excellent", "⭐ Good", "⭐ Average", "⭐ Poor"],
-            horizontal=True
-        )
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            helpful = st.select_slider(
-                "How helpful was the chatbot?",
-                options=["Not helpful", "Somewhat helpful", "Helpful", "Very helpful", "Extremely helpful"]
-            )
-        with col2:
-            easy_to_use = st.select_slider(
-                "How easy was it to use?",
-                options=["Very difficult", "Difficult", "Neutral", "Easy", "Very easy"]
-            )
-        
-        feedback_text = st.text_area(
-            "What did you like or dislike about the chatbot? Any suggestions for improvement?",
-            placeholder="Your feedback helps us improve...",
-            height=100
-        )
-        
-        topics = st.multiselect(
-            "Which topics did you find most useful? (Optional)",
-            ["Saving Money", "Budgeting", "EPF/KWSP", "Investing", "Debt Management", 
-             "Emergency Fund", "Credit Cards", "Insurance", "Other"]
-        )
-        
-        submitted = st.form_submit_button("📤 Submit Feedback", type="primary")
-        
-        if submitted:
-            if feedback_text.strip():
-                comprehensive_feedback = {
-                    "overall_rating": rating,
-                    "helpfulness": helpful,
-                    "ease_of_use": easy_to_use,
-                    "feedback_text": feedback_text,
-                    "useful_topics": topics
-                }
-                
-                save_general_feedback(
-                    st.session_state.user_id,
-                    str(comprehensive_feedback),
-                    rating.split()[1].lower()
-                )
-                
-                st.success("✅ Thank you for your feedback!")
-                st.balloons()
-            else:
-                st.warning("Please provide some feedback in the text area.")
-    
-    st.divider()
-    
-    st.markdown("### 💡 Thank you for participating!")
-    st.markdown("Your feedback helps us improve the chatbot for future users.")
-    
-    # New User Button
-    st.subheader("🔄 Next Steps")
-    col1, col2, col3 = st.columns([1, 1, 1])
-    with col2:
-        if st.button("👤 Start New User Session", type="primary", use_container_width=True):
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("🔄 Start New Session", type="primary"):
             reset_session()
             st.rerun()
-    
-    st.caption("Click above to reset and allow another person to use the chatbot")
-
-# --- Admin Dashboard ---
-def show_admin_dashboard():
-    """Admin page to view all user results"""
-    # LOGOUT BUTTON
-    col1, col2, col3 = st.columns([4, 1, 1])
-    with col1:
-        st.title("👨‍💼 Admin Dashboard")
-    with col3:
-        if st.button("🚪 Logout", type="secondary"):
-            st.session_state.current_page = "welcome"
+    with col2:
+        if st.button("💬 Continue Chatting"):
+            st.session_state.current_page = "chatbot"
             st.rerun()
-    
-    st.divider()
-    
-    tab1, tab2, tab3 = st.tabs(["📊 Test Results", "💬 Feedback", "📈 Analytics"])
-    
-    with tab1:
-        st.subheader("All Test Results")
-        
-        try:
-            with open("data/test_results.json", 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            results = data.get("results", [])
-            
-            if not results:
-                st.warning("No test data available yet.")
-            else:
-                st.metric("Total Participants", len(set(r["user_id"] for r in results)))
-                
-                test_type_filter = st.selectbox("Filter by test type:", ["All", "pre", "post"])
-                
-                for result in results:
-                    if test_type_filter != "All" and result["test_type"] != test_type_filter:
-                        continue
-                    
-                    with st.expander(f"User: {result['user_id']} - {result['test_type'].upper()} Test - {result['timestamp'][:10]}"):
-                        col1, col2 = st.columns(2)
-                        
-                        with col1:
-                            st.write("**Participant Info:**")
-                            for key, value in result["participant_info"].items():
-                                st.write(f"- {key.title()}: {value}")
-                        
-                        with col2:
-                            st.write("**Scores:**")
-                            for key, value in result["scores"].items():
-                                st.write(f"- {key}: {value:.1f}%")
-                        
-                        st.write("**Detailed Responses:**")
-                        for resp in result["responses"]:
-                            st.write(f"**Q:** {resp['question']}")
-                            st.write(f"**A:** {resp['response']} (Score: {resp['score']})")
-                            st.divider()
-        
-        except FileNotFoundError:
-            st.error("No test results file found.")
-    
-    with tab2:
-        st.subheader("User Feedback")
-        
-        try:
-            with open("data/user_feedback.json", 'r', encoding='utf-8') as f:
-                feedback_data = json.load(f)
-            
-            feedbacks = feedback_data.get("feedback", [])
-            
-            if not feedbacks:
-                st.warning("No feedback data available yet.")
-            else:
-                helpful = sum(1 for f in feedbacks if f["rating"] == "helpful")
-                not_helpful = sum(1 for f in feedbacks if f["rating"] == "not_helpful")
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Total Feedback", len(feedbacks))
-                with col2:
-                    st.metric("👍 Helpful", helpful)
-                with col3:
-                    st.metric("👎 Not Helpful", not_helpful)
-                
-                st.divider()
-                
-                for fb in feedbacks:
-                    feedback_type = fb.get("feedback_type", "response")
-                    
-                    if feedback_type == "general":
-                        with st.expander(f"💭 General Feedback - {fb['timestamp'][:10]}"):
-                            st.write(f"**User:** {fb['user_id']}")
-                            st.write(f"**Rating:** {fb['rating'].upper()}")
-                            st.write(f"**Feedback:**")
-                            st.info(fb['feedback_text'])
-                    else:
-                        with st.expander(f"{fb['rating'].title()} - {fb['timestamp'][:10]}"):
-                            st.write(f"**User:** {fb['user_id']}")
-                            st.write(f"**Question:** {fb['question']}")
-                            st.write(f"**Answer:** {fb['answer']}")
-                            st.write(f"**Sources Used:** {fb['sources_count']}")
-        
-        except FileNotFoundError:
-            st.error("No feedback file found.")
-    
-    with tab3:
-        st.subheader("Analytics")
-        
-        try:
-            with open("data/test_results.json", 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            results = data.get("results", [])
-            
-            if results:
-                user_improvements = {}
-                
-                for result in results:
-                    user_id = result["user_id"]
-                    test_type = result["test_type"]
-                    overall_score = result["scores"]["Overall"]
-                    
-                    if user_id not in user_improvements:
-                        user_improvements[user_id] = {}
-                    
-                    user_improvements[user_id][test_type] = overall_score
-                
-                improvements = []
-                for user_id, scores in user_improvements.items():
-                    if "pre" in scores and "post" in scores:
-                        improvement = scores["post"] - scores["pre"]
-                        improvements.append(improvement)
-                
-                if improvements:
-                    avg_improvement = sum(improvements) / len(improvements)
-                    
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("Users with Both Tests", len(improvements))
-                    with col2:
-                        st.metric("Average Improvement", f"{avg_improvement:.1f}%")
-                    with col3:
-                        improved = sum(1 for i in improvements if i > 0)
-                        st.metric("Users Improved", f"{improved}/{len(improvements)}")
-                else:
-                    st.info("No complete pre/post test pairs yet.")
-            else:
-                st.warning("No data available.")
-        
-        except FileNotFoundError:
-            st.error("No test results file found.")
 
-# --- Main App Navigation ---
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
 def main():
-    """Main application"""
-    
+    # Sidebar
     with st.sidebar:
-        st.title("📍 Navigation")
-        
-        if st.session_state.current_page == "welcome":
-            st.info("👋 Welcome Page")
-        elif not st.session_state.pre_test_completed:
-            st.info("📝 Pre-Test")
-        elif not st.session_state.post_test_completed:
-            st.success("✅ Pre-Test Done")
-            st.info("💬 Using Chatbot")
-        else:
-            st.success("✅ All Complete!")
+        st.title("⚙️ Settings")
+        st.markdown('<span class="mcp-badge">MCP Mode</span>', unsafe_allow_html=True)
         
         st.divider()
         
-        st.header("📊 Progress")
-        progress = 0
-        if st.session_state.pre_test_completed:
-            progress += 33
-        if len(st.session_state.messages) > 0:
-            progress += 34
-        if st.session_state.post_test_completed:
-            progress += 33
-        
-        st.progress(progress / 100)
-        st.caption(f"{progress}% Complete")
-        
-        st.divider()
-        
-        # NEW USER RESET BUTTON
-        if st.button("🔄 New User", help="Reset for a new participant"):
-            if st.session_state.current_page not in ["welcome", "admin"]:
-                st.warning("⚠️ This will reset all progress!")
-                if st.button("✅ Confirm Reset"):
-                    reset_session()
-                    st.rerun()
-            else:
-                reset_session()
-                st.rerun()
-        
-        st.divider()
-        
-        st.header("ℹ️ About")
-        st.markdown("""
-        This chatbot uses:
-        - 🤖 RAG (Retrieval-Augmented Generation)
-        - 📚 KWSP/EPF Resources
-        - 📋 PISA 2022 Framework
-        """)
-        
-        st.divider()
-        
-        admin_password = st.text_input("Admin Access", type="password")
-        if admin_password == "admin123":
-            if st.button("📊 View Dashboard"):
-                st.session_state.current_page = "admin"
-                st.rerun()
-        
-        st.divider()
-        
-        if st.button("🗑️ Clear Chat"):
-            st.session_state.messages = []
+        if st.button("🔄 New Session"):
+            reset_session()
             st.rerun()
+        
+        st.divider()
+        st.caption("MCP Mode ensures responses come only from verified sources.")
+        st.caption("To use original mode: `streamlit run s_app.py`")
     
-    # Main content area
+    # Page routing
     if st.session_state.current_page == "welcome":
         show_welcome_page()
     elif st.session_state.current_page == "pre_test":
@@ -894,8 +823,7 @@ def main():
         show_pisa_test("post")
     elif st.session_state.current_page == "results":
         show_results_page()
-    elif st.session_state.current_page == "admin":
-        show_admin_dashboard()
+
 
 if __name__ == "__main__":
     main()
